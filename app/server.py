@@ -7,6 +7,10 @@ from sentence_transformers import SentenceTransformer
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 
+import time
+from datetime import datetime
+import json
+
 GLOBAL_CONFIG = {
     "model": {
         "featurizer": {
@@ -14,11 +18,11 @@ GLOBAL_CONFIG = {
             "sentence_transformer_embedding_dim": 768
         },
         "classifier": {
-            "serialized_model_path": "./data/news_classifier.joblib"
+            "serialized_model_path": "../data/news_classifier.joblib"
         }
     },
     "service": {
-        "log_destination": "./data/logs.out"
+        "log_destination": "../data/logs.out"
     }
 }
 
@@ -45,11 +49,7 @@ class TransformerFeaturizer(BaseEstimator, TransformerMixin):
 
     #transformation: return the encoding of the document as returned by the transformer model
     def transform(self, X, y=None):
-        X_t = []
-        for doc in X:
-            X_t.append(self.sentence_transformer_model.encode(doc))
-        return X_t
-
+        return self.sentence_transformer_model.encode(X, normalize_embeddings=True)
 
 class NewsCategoryClassifier:
     def __init__(self, config: dict) -> None:
@@ -59,8 +59,12 @@ class NewsCategoryClassifier:
         1. Load the sentence transformer model and initialize the `featurizer` of type `TransformerFeaturizer` (Hint: revisit Week 1 Step 4)
         2. Load the serialized model as defined in GLOBAL_CONFIG['model'] into memory and initialize `model`
         """
-        featurizer = None
-        model = None
+        sentence_transfomer = SentenceTransformer('sentence-transformers/{model}'.format(
+            model=GLOBAL_CONFIG['model']['featurizer']["sentence_transformer_model"]))
+        dim = GLOBAL_CONFIG['model']['featurizer']["sentence_transformer_embedding_dim"]
+        featurizer = TransformerFeaturizer(dim, sentence_transfomer)
+        model = joblib.load(GLOBAL_CONFIG['model']['classifier']["serialized_model_path"])
+        self.classes = model.classes_
         self.pipeline = Pipeline([
             ('transformer_featurizer', featurizer),
             ('classifier', model)
@@ -80,7 +84,10 @@ class NewsCategoryClassifier:
             ...
         }
         """
-        return {}
+
+        result = self.pipeline.predict_proba([model_input.description]).flatten()
+        classes = self.classes
+        return dict(zip(classes, result))
 
     def predict_label(self, model_input: dict) -> str:
         """
@@ -91,7 +98,7 @@ class NewsCategoryClassifier:
 
         Output format: predicted label for the model input
         """
-        return ""
+        return self.pipeline.predict([model_input.description])
 
 
 app = FastAPI()
@@ -106,6 +113,11 @@ def startup_event():
         Access to the model instance and log file will be needed in /predict endpoint, make sure you
         store them as global variables
     """
+    global log_file
+    global classifier
+    classifier = NewsCategoryClassifier(GLOBAL_CONFIG)
+    log_file = open(GLOBAL_CONFIG["service"]["log_destination"], "a")
+
     logger.info("Setup completed")
 
 
@@ -117,6 +129,7 @@ def shutdown_event():
         1. Make sure to flush the log file and close any file pointers to avoid corruption
         2. Any other cleanups
     """
+    log_file.close()
     logger.info("Shutting down application")
 
 
@@ -137,9 +150,38 @@ def predict(request: PredictRequest):
         }
         3. Construct an instance of `PredictResponse` and return
     """
-    return {}
+    # Inference
+    t0 = time.time()
+    probs = classifier.predict_proba(request)
+    pred = classifier.predict_label(request)[0]
+    t1 = time.time()
+    inference_time = t1 - t0
+
+    # Logging
+    log_info = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "request": request.dict(),
+        "prediction": {'label': pred, 'scores':probs},
+        "latency": inference_time,
+    }
+    log_file.write(f"{json.dumps(log_info)}\n")
+    log_file.flush()
+    return PredictResponse(scores=probs, label=pred)
 
 
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
+
+if __name__ == '__main__':
+    test = NewsCategoryClassifier(GLOBAL_CONFIG)
+    input_test = {
+      "source": "<value>",
+      "url": "<value>",
+      "title": "<value>",
+      "description": "This is a test phrase about Football and Voleyball."
+    }
+    print(test.predict_proba(input_test))
+
+    print(test.predict_label(input_test))
+    
